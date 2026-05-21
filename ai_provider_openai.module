@@ -1,0 +1,31 @@
+<?php
+
+/**
+ * @file
+ * OpenAI provider for AI core.
+ */
+
+/**
+ * Implements hook_autoload_info().
+ */
+function ai_provider_openai_autoload_info() {
+  return [
+    'AIOpenAIAdapter' => 'includes/AIOpenAIAdapter.php',
+  ];
+}
+
+/**
+ * Implements hook_ai_provider_info().
+ */
+function ai_provider_openai_ai_provider_info() {
+  return [
+    'openai' => [
+      'label' => t('OpenAI'),
+      'description' => t('Official OpenAI provider for chat, images, embeddings, speech, and moderation.'),
+      'class' => 'AIOpenAIAdapter',
+      'website' => 'https://platform.openai.com/',
+      'key_url' => 'https://platform.openai.com/account/api-keys',
+      'models_url' => 'https://platform.openai.com/docs/models',
+    ],
+  ];
+}

@@ -1,0 +1,7 @@
+name = AI Provider OpenAI
+description = OpenAI provider for the AI module family.
+backdrop = 1.x
+type = module
+package = AI
+dependencies[] = ai
+dependencies[] = key
