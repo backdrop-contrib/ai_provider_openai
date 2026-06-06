@@ -411,6 +411,24 @@ class AIOpenAIAdapter extends AIAdapterBase {
               'text' => (string) $item['text'],
             ];
           }
+          elseif (is_array($item) && ($item['type'] ?? '') === 'image_url' && isset($item['image_url']) && $role !== 'assistant') {
+            $image_url = $this->normalizeResponsesImageUrl($item['image_url']);
+            if ($image_url !== NULL) {
+              $content_parts[] = [
+                'type' => 'input_image',
+                'image_url' => $image_url,
+              ];
+            }
+          }
+          elseif (is_array($item) && ($item['type'] ?? '') === 'input_image' && isset($item['image_url']) && $role !== 'assistant') {
+            $image_url = $this->normalizeResponsesImageUrl($item['image_url']);
+            if ($image_url !== NULL) {
+              $content_parts[] = [
+                'type' => 'input_image',
+                'image_url' => $image_url,
+              ];
+            }
+          }
         }
       }
 
@@ -522,6 +540,24 @@ class AIOpenAIAdapter extends AIAdapterBase {
               'text' => (string) $item['text'],
             ];
           }
+          elseif (is_array($item) && ($item['type'] ?? '') === 'image_url' && isset($item['image_url'])) {
+            $image_url = $this->normalizeResponsesImageUrl($item['image_url']);
+            if ($image_url !== NULL) {
+              $content_parts[] = [
+                'type' => 'input_image',
+                'image_url' => $image_url,
+              ];
+            }
+          }
+          elseif (is_array($item) && ($item['type'] ?? '') === 'input_image' && isset($item['image_url'])) {
+            $image_url = $this->normalizeResponsesImageUrl($item['image_url']);
+            if ($image_url !== NULL) {
+              $content_parts[] = [
+                'type' => 'input_image',
+                'image_url' => $image_url,
+              ];
+            }
+          }
         }
       }
 
@@ -566,6 +602,12 @@ class AIOpenAIAdapter extends AIAdapterBase {
         }
         elseif ($role !== 'assistant' && in_array($type, ['input_text', 'text'], TRUE) && isset($part['text'])) {
           $normalized_parts[] = ['type' => 'input_text', 'text' => (string) $part['text']];
+        }
+        elseif ($role !== 'assistant' && in_array($type, ['image_url', 'input_image'], TRUE) && isset($part['image_url'])) {
+          $image_url = $this->normalizeResponsesImageUrl($part['image_url']);
+          if ($image_url !== NULL) {
+            $normalized_parts[] = ['type' => 'input_image', 'image_url' => $image_url];
+          }
         }
       }
 
@@ -616,6 +658,21 @@ class AIOpenAIAdapter extends AIAdapterBase {
     }
 
     return trim($output_text);
+  }
+
+  /**
+   * Normalize legacy image_url payloads for Responses API.
+   */
+  protected function normalizeResponsesImageUrl($image_url) {
+    if (is_string($image_url) && $image_url !== '') {
+      return $image_url;
+    }
+
+    if (is_array($image_url) && !empty($image_url['url']) && is_string($image_url['url'])) {
+      return $image_url['url'];
+    }
+
+    return NULL;
   }
 
   /**
