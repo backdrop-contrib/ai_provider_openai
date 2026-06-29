@@ -124,6 +124,9 @@ class AIOpenAIAdapter extends AIAdapterBase {
       }
 
       if ($stream_response) {
+        // Without stream=true the API returns one JSON object, which the
+        // SSE line parser silently discards.
+        $payload['stream'] = TRUE;
         return $this->buildStreamingResponse($this->baseUrl . '/completions', [
           'method' => 'POST',
           'headers' => array_merge([
@@ -137,7 +140,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
         });
       }
 
-      $result = $this->makeRequest($this->baseUrl . '/completions', $payload);
+      $result = $this->makeRequest($this->baseUrl . '/completions', $payload, [], 'POST', 300);
       return trim($result['choices'][0]['text'] ?? '');
     }
     catch (\Exception $e) {
@@ -165,6 +168,9 @@ class AIOpenAIAdapter extends AIAdapterBase {
       }
 
       if ($stream_response) {
+        // Without stream=true the API returns one JSON object, which the
+        // SSE line parser silently discards.
+        $payload['stream'] = TRUE;
         return $this->buildStreamingResponse($this->baseUrl . '/chat/completions', [
           'method' => 'POST',
           'headers' => array_merge([
@@ -178,7 +184,9 @@ class AIOpenAIAdapter extends AIAdapterBase {
         });
       }
 
-      $result = $this->makeRequest($this->baseUrl . '/chat/completions', $payload);
+      // Long generations (large prompts, OCR/reformat jobs) routinely exceed
+      // the 30s makeRequest() default; match the 300s the streaming path uses.
+      $result = $this->makeRequest($this->baseUrl . '/chat/completions', $payload, [], 'POST', 300);
       return trim($result['choices'][0]['message']['content'] ?? $result['choices'][0]['text'] ?? '');
     }
     catch (\Exception $e) {
@@ -206,7 +214,8 @@ class AIOpenAIAdapter extends AIAdapterBase {
         $payload['output_format'] = $output_format;
       }
 
-      return $this->makeRequest($this->baseUrl . '/images/generations', $payload);
+      // Image generation regularly takes longer than 30 seconds.
+      return $this->makeRequest($this->baseUrl . '/images/generations', $payload, [], 'POST', 300);
     }
     catch (\Exception $e) {
       watchdog('ai_provider_openai', 'Images error: @message', ['@message' => $e->getMessage()], WATCHDOG_ERROR);
@@ -224,7 +233,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
         'input' => $input,
         'voice' => $voice,
         'response_format' => $response_format,
-      ]);
+      ], [], 'POST', 300);
     }
     catch (\Exception $e) {
       watchdog('ai_provider_openai', 'TTS error: @message', ['@message' => $e->getMessage()], WATCHDOG_ERROR);
@@ -319,7 +328,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
         }
       }
 
-      $result = $this->makeRequest($this->baseUrl . '/chat/completions', $payload);
+      $result = $this->makeRequest($this->baseUrl . '/chat/completions', $payload, [], 'POST', 300);
       return $this->normalizeToolResponse($result);
     }
     catch (\Exception $e) {
@@ -344,7 +353,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
     ];
     $payload = $this->sanitizeResponsesPayload($payload);
 
-    $result = $this->makeRequest($this->baseUrl . '/responses', $payload);
+    $result = $this->makeRequest($this->baseUrl . '/responses', $payload, [], 'POST', 300);
     return $this->normalizeResponsesToolResponse($result);
   }
 
@@ -366,7 +375,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
     }
     $payload = $this->sanitizeResponsesPayload($payload);
 
-    $result = $this->makeRequest($this->baseUrl . '/responses', $payload);
+    $result = $this->makeRequest($this->baseUrl . '/responses', $payload, [], 'POST', 300);
     if (!empty($result['output_text'])) {
       return trim($result['output_text']);
     }
