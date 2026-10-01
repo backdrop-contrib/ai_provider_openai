@@ -14,6 +14,9 @@ class AIOpenAIAdapter extends AIAdapterBase {
    */
   protected $baseUrl = 'https://api.openai.com/v1';
 
+  /** @var array|null Catalog reused across capability lookups. */
+  protected $models;
+
   /**
    * {@inheritdoc}
    */
@@ -27,6 +30,9 @@ class AIOpenAIAdapter extends AIAdapterBase {
    * {@inheritdoc}
    */
   public function getModels(): array {
+    if ($this->models !== NULL) {
+      return $this->models;
+    }
     $models = [];
 
     try {
@@ -36,12 +42,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
         if (empty($id)) {
           continue;
         }
-        if (!preg_match('/^(gpt|text|tts|whisper|dall-e|gpt-image|o[1-9]|.*moderation)/i', $id)) {
-          continue;
-        }
-        if (preg_match('/(search|similarity|edit|instruct)/i', $id)) {
-          continue;
-        }
+        // Preserve the full catalog so new families can be assigned manually.
         $models[$id] = $model['id'];
       }
     }
@@ -53,7 +54,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
       asort($models);
     }
 
-    return $models;
+    return $this->models = $models;
   }
 
   /**
@@ -61,11 +62,34 @@ class AIOpenAIAdapter extends AIAdapterBase {
    */
   public function getModelsByCapability($capability): array {
     $models = $this->getModels();
+    $capability = ai_normalize_capability_name($capability);
+    // /models has no capability metadata. Keep these fallback rules narrow;
+    // the central UI can classify new families without a code update.
+    $chat_models = array_filter($models, function ($id) {
+      return preg_match('/^(gpt-|o[1-9])/', $id)
+        && !preg_match('/image|tts|transcribe|realtime|audio|instruct|search|deep-research|codex|computer-use|embedding/', $id);
+    }, ARRAY_FILTER_USE_KEY);
     switch ($capability) {
       case 'text':
       case 'chat':
-        $filtered = array_filter($models, function ($id) {
-          return preg_match('/^(gpt|o[1-9])/i', $id);
+        $filtered = $chat_models;
+        break;
+
+      case 'vision':
+        $filtered = array_filter($chat_models, function ($id) {
+          return (bool) preg_match('/^(gpt-4o|gpt-4\.1|gpt-4-turbo|gpt-[5-9]|o[34])/', $id);
+        }, ARRAY_FILTER_USE_KEY);
+        break;
+
+      case 'tool_calling':
+        $filtered = array_filter($chat_models, function ($id) {
+          return !preg_match('/^o1-(preview|mini)/', $id);
+        }, ARRAY_FILTER_USE_KEY);
+        break;
+
+      case 'thinking':
+        $filtered = array_filter($chat_models, function ($id) {
+          return (bool) preg_match('/^(o[1-9]|gpt-[5-9])/', $id);
         }, ARRAY_FILTER_USE_KEY);
         break;
 
@@ -84,13 +108,13 @@ class AIOpenAIAdapter extends AIAdapterBase {
 
       case 'tts':
         $filtered = array_filter($models, function ($id) {
-          return strpos($id, 'tts-') === 0;
+          return strpos($id, 'tts-') === 0 || strpos($id, 'gpt-4o-mini-tts') === 0;
         }, ARRAY_FILTER_USE_KEY);
         break;
 
       case 'stt':
         $filtered = array_filter($models, function ($id) {
-          return strpos($id, 'whisper-') === 0;
+          return strpos($id, 'whisper-') === 0 || (strpos($id, 'gpt-4o') === 0 && strpos($id, '-transcribe') !== FALSE);
         }, ARRAY_FILTER_USE_KEY);
         break;
 
@@ -101,7 +125,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
         break;
 
       default:
-        $filtered = $models;
+        $filtered = [];
         break;
     }
 
@@ -155,7 +179,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
   public function chat(string $model, array $messages, $temperature, $max_tokens = 1024, bool $stream_response = FALSE, array $context_extra = []) {
     try {
       if ($this->modelUsesResponsesApi($model)) {
-        return $this->chatWithResponsesApi($model, $messages, $temperature, $max_tokens);
+        return $this->chatWithResponsesApi($model, $messages, $temperature, $max_tokens, $context_extra);
       }
 
       $payload = [
@@ -165,6 +189,27 @@ class AIOpenAIAdapter extends AIAdapterBase {
       ];
       if ((int) $max_tokens > 0) {
         $payload['max_tokens'] = (int) $max_tokens;
+      }
+
+      if (!empty($context_extra['response_format'])) {
+        $payload['response_format'] = $context_extra['response_format'];
+      }
+      elseif (!empty($context_extra['json_schema'])) {
+        $payload['response_format'] = [
+          'type' => 'json_schema',
+          'json_schema' => [
+            'name' => $context_extra['json_schema_name'] ?? 'response',
+            'strict' => TRUE,
+            'schema' => $context_extra['json_schema'],
+          ],
+        ];
+      }
+      elseif (!empty($context_extra['json_mode'])) {
+        $payload['response_format'] = ['type' => 'json_object'];
+      }
+
+      if (!empty($context_extra['reasoning_effort'])) {
+        $payload['reasoning_effort'] = $context_extra['reasoning_effort'];
       }
 
       if ($stream_response) {
@@ -203,9 +248,13 @@ class AIOpenAIAdapter extends AIAdapterBase {
       $payload = [
         'model' => $model,
         'prompt' => $prompt,
-        'size' => $size,
-        'response_format' => $response_format,
+        'size' => AIImageHelper::openAiSize($model, $size),
       ];
+      // Only DALL-E accepts response_format; gpt-image models always return
+      // b64_json and reject the parameter with a 400.
+      if (str_starts_with($model, 'dall-e')) {
+        $payload['response_format'] = $response_format;
+      }
       if ($model === 'dall-e-3') {
         $payload['quality'] = $quality;
         $payload['style'] = $style;
@@ -247,6 +296,16 @@ class AIOpenAIAdapter extends AIAdapterBase {
   public function speechToText(string $model, string $file, string $task = 'transcribe', $temperature = 0.4, string $response_format = 'verbose_json') {
     if (!in_array($task, ['transcribe', 'translate'], TRUE)) {
       throw new \InvalidArgumentException('Task must be transcribe or translate.');
+    }
+
+    // The gpt-4o transcribe models accept only json/text and have no
+    // translations endpoint; only whisper-1 supports both.
+    $is_whisper = strpos($model, 'whisper-') === 0;
+    if ($task === 'translate' && !$is_whisper) {
+      throw new \InvalidArgumentException('Translation is only supported by whisper models.');
+    }
+    if (!$is_whisper && !in_array($response_format, ['json', 'text'], TRUE)) {
+      $response_format = 'json';
     }
 
     try {
@@ -308,7 +367,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
     try {
       $uses_responses_api = $this->modelUsesResponsesApi($model);
       if ($uses_responses_api) {
-        return $this->chatWithToolsResponsesApi($model, $messages, $tools, $temperature, $max_tokens, $tool_choice);
+        return $this->chatWithToolsResponsesApi($model, $messages, $tools, $temperature, $max_tokens, $tool_choice, $context_extra);
       }
       $payload = [
         'model' => $model,
@@ -328,6 +387,27 @@ class AIOpenAIAdapter extends AIAdapterBase {
         }
       }
 
+      if (!empty($context_extra['response_format'])) {
+        $payload['response_format'] = $context_extra['response_format'];
+      }
+      elseif (!empty($context_extra['json_schema'])) {
+        $payload['response_format'] = [
+          'type' => 'json_schema',
+          'json_schema' => [
+            'name' => $context_extra['json_schema_name'] ?? 'response',
+            'strict' => TRUE,
+            'schema' => $context_extra['json_schema'],
+          ],
+        ];
+      }
+      elseif (!empty($context_extra['json_mode'])) {
+        $payload['response_format'] = ['type' => 'json_object'];
+      }
+
+      if (!empty($context_extra['reasoning_effort'])) {
+        $payload['reasoning_effort'] = $context_extra['reasoning_effort'];
+      }
+
       $result = $this->makeRequest($this->baseUrl . '/chat/completions', $payload, [], 'POST', 300);
       return $this->normalizeToolResponse($result);
     }
@@ -340,17 +420,21 @@ class AIOpenAIAdapter extends AIAdapterBase {
   /**
    * Handle tool calling using the Responses API for newer models.
    */
-  protected function chatWithToolsResponsesApi(string $model, array $messages, array $tools, $temperature, $max_tokens, string $tool_choice): array {
+  protected function chatWithToolsResponsesApi(string $model, array $messages, array $tools, $temperature, $max_tokens, string $tool_choice, array $context_extra = []): array {
     [$input_items, $instructions] = $this->toResponsesToolItemsAndInstructions($messages);
+    $effort = $context_extra['reasoning_effort'] ?? 'low';
     $payload = [
       'model' => $model,
       'input' => $input_items,
       'instructions' => $instructions,
       'tools' => $this->normalizeResponsesTools($tools),
       'tool_choice' => $tool_choice,
-      'reasoning' => ['effort' => 'low'],
+      'reasoning' => ['effort' => $effort],
       'max_output_tokens' => max((int) $max_tokens, 512),
     ];
+    if ($format = $this->responsesTextFormat($context_extra)) {
+      $payload['text'] = ['format' => $format];
+    }
     $payload = $this->sanitizeResponsesPayload($payload);
 
     $result = $this->makeRequest($this->baseUrl . '/responses', $payload, [], 'POST', 300);
@@ -361,17 +445,51 @@ class AIOpenAIAdapter extends AIAdapterBase {
     return (bool) preg_match('/^(gpt-5|o[0-9])/i', $model);
   }
 
-  protected function chatWithResponsesApi(string $model, array $messages, $temperature, $max_tokens) {
+  /**
+   * Map structured-output options to the Responses API text.format shape.
+   *
+   * Same precedence as the Chat Completions path: response_format, then
+   * json_schema, then json_mode.
+   */
+  protected function responsesTextFormat(array $context_extra): ?array {
+    if (!empty($context_extra['response_format']) && is_array($context_extra['response_format'])) {
+      $format = $context_extra['response_format'];
+      // Chat Completions nests the schema under json_schema; Responses
+      // flattens it into the format object.
+      if (($format['type'] ?? '') === 'json_schema' && isset($format['json_schema']) && is_array($format['json_schema'])) {
+        return ['type' => 'json_schema'] + $format['json_schema'];
+      }
+      return $format;
+    }
+    if (!empty($context_extra['json_schema'])) {
+      return [
+        'type' => 'json_schema',
+        'name' => $context_extra['json_schema_name'] ?? 'response',
+        'strict' => TRUE,
+        'schema' => $context_extra['json_schema'],
+      ];
+    }
+    if (!empty($context_extra['json_mode'])) {
+      return ['type' => 'json_object'];
+    }
+    return NULL;
+  }
+
+  protected function chatWithResponsesApi(string $model, array $messages, $temperature, $max_tokens, array $context_extra = []) {
     [$input_items, $instructions] = $this->toResponsesItemsAndInstructions($messages);
+    $effort = $context_extra['reasoning_effort'] ?? 'low';
     $payload = [
       'model' => $model,
       'input' => $input_items,
       'instructions' => $instructions,
-      'reasoning' => ['effort' => 'low'],
+      'reasoning' => ['effort' => $effort],
       'max_output_tokens' => max((int) $max_tokens, 512),
     ];
     if (!$this->modelIgnoresTemperature($model)) {
       $payload['temperature'] = (float) $temperature;
+    }
+    if ($format = $this->responsesTextFormat($context_extra)) {
+      $payload['text'] = ['format' => $format];
     }
     $payload = $this->sanitizeResponsesPayload($payload);
 
