@@ -178,61 +178,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
    */
   public function chat(string $model, array $messages, $temperature, $max_tokens = 1024, bool $stream_response = FALSE, array $context_extra = []) {
     try {
-      if ($this->modelUsesResponsesApi($model)) {
-        return $this->chatWithResponsesApi($model, $messages, $temperature, $max_tokens, $context_extra);
-      }
-
-      $payload = [
-        'model' => $model,
-        'messages' => $messages,
-        'temperature' => (float) $temperature,
-      ];
-      if ((int) $max_tokens > 0) {
-        $payload['max_tokens'] = (int) $max_tokens;
-      }
-
-      if (!empty($context_extra['response_format'])) {
-        $payload['response_format'] = $context_extra['response_format'];
-      }
-      elseif (!empty($context_extra['json_schema'])) {
-        $payload['response_format'] = [
-          'type' => 'json_schema',
-          'json_schema' => [
-            'name' => $context_extra['json_schema_name'] ?? 'response',
-            'strict' => TRUE,
-            'schema' => $context_extra['json_schema'],
-          ],
-        ];
-      }
-      elseif (!empty($context_extra['json_mode'])) {
-        $payload['response_format'] = ['type' => 'json_object'];
-      }
-
-      if (!empty($context_extra['reasoning_effort'])) {
-        $payload['reasoning_effort'] = $context_extra['reasoning_effort'];
-      }
-
-      if ($stream_response) {
-        // Without stream=true the API returns one JSON object, which the
-        // SSE line parser silently discards.
-        $payload['stream'] = TRUE;
-        return $this->buildStreamingResponse($this->baseUrl . '/chat/completions', [
-          'method' => 'POST',
-          'headers' => array_merge([
-            'Accept' => 'text/event-stream',
-            'Content-Type' => 'application/json',
-          ], $this->getDefaultHeaders()),
-          'data' => json_encode($payload),
-          'timeout' => 300,
-        ], function ($data) {
-          return $data['choices'][0]['delta']['content'] ?? '';
-        });
-      }
-
-      // Long generations (large prompts, OCR/reformat jobs) routinely exceed
-      // the 30s makeRequest() default; match the 300s the streaming path uses.
-      $result = $this->makeRequest($this->baseUrl . '/chat/completions', $payload, [], 'POST', 300);
-      return trim($result['choices'][0]['message']['content'] ?? $result['choices'][0]['text'] ?? '');
+      return $this->chatWithResponsesApi($model, $messages, $temperature, $max_tokens, $context_extra, $stream_response);
     }
     catch (\Exception $e) {
       watchdog('ai_provider_openai', 'Chat error: @message', ['@message' => $e->getMessage()], WATCHDOG_ERROR);
@@ -365,51 +311,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
    */
   public function chatWithTools(string $model, array $messages, array $tools, $temperature, $max_tokens = 1024, string $tool_choice = 'auto', array $context_extra = []): array {
     try {
-      $uses_responses_api = $this->modelUsesResponsesApi($model);
-      if ($uses_responses_api) {
-        return $this->chatWithToolsResponsesApi($model, $messages, $tools, $temperature, $max_tokens, $tool_choice, $context_extra);
-      }
-      $payload = [
-        'model' => $model,
-        'messages' => $messages,
-        'tools' => $tools,
-        'tool_choice' => $tool_choice,
-      ];
-      if (!$uses_responses_api) {
-        $payload['temperature'] = (float) $temperature;
-      }
-      if ((int) $max_tokens > 0) {
-        if ($uses_responses_api) {
-          $payload['max_completion_tokens'] = (int) $max_tokens;
-        }
-        else {
-          $payload['max_tokens'] = (int) $max_tokens;
-        }
-      }
-
-      if (!empty($context_extra['response_format'])) {
-        $payload['response_format'] = $context_extra['response_format'];
-      }
-      elseif (!empty($context_extra['json_schema'])) {
-        $payload['response_format'] = [
-          'type' => 'json_schema',
-          'json_schema' => [
-            'name' => $context_extra['json_schema_name'] ?? 'response',
-            'strict' => TRUE,
-            'schema' => $context_extra['json_schema'],
-          ],
-        ];
-      }
-      elseif (!empty($context_extra['json_mode'])) {
-        $payload['response_format'] = ['type' => 'json_object'];
-      }
-
-      if (!empty($context_extra['reasoning_effort'])) {
-        $payload['reasoning_effort'] = $context_extra['reasoning_effort'];
-      }
-
-      $result = $this->makeRequest($this->baseUrl . '/chat/completions', $payload, [], 'POST', 300);
-      return $this->normalizeToolResponse($result);
+      return $this->chatWithToolsResponsesApi($model, $messages, $tools, $temperature, $max_tokens, $tool_choice, $context_extra);
     }
     catch (\Exception $e) {
       watchdog('ai_provider_openai', 'chatWithTools error: @message', ['@message' => $e->getMessage()], WATCHDOG_ERROR);
@@ -429,6 +331,7 @@ class AIOpenAIAdapter extends AIAdapterBase {
       'instructions' => $instructions,
       'tools' => $this->normalizeResponsesTools($tools),
       'tool_choice' => $tool_choice,
+      'temperature' => (float) $temperature,
       'reasoning' => ['effort' => $effort],
       'max_output_tokens' => max((int) $max_tokens, 512),
     ];
@@ -437,12 +340,52 @@ class AIOpenAIAdapter extends AIAdapterBase {
     }
     $payload = $this->sanitizeResponsesPayload($payload);
 
-    $result = $this->makeRequest($this->baseUrl . '/responses', $payload, [], 'POST', 300);
+    $result = $this->postResponses($model, $payload);
     return $this->normalizeResponsesToolResponse($result);
   }
 
-  protected function modelUsesResponsesApi(string $model): bool {
-    return (bool) preg_match('/^(gpt-5|o[0-9])/i', $model);
+  /**
+   * {@inheritdoc}
+   *
+   * Reasoning models refuse temperature and top_p; older models refuse
+   * reasoning.
+   */
+  protected function optionalParams(): array {
+    return ['temperature', 'top_p', 'reasoning'];
+  }
+
+  /**
+   * {@inheritdoc}
+   *
+   * OpenAI names the refused param in the error body, so read it from there
+   * instead of matching the message text.
+   */
+  protected function rejectedParam(string $message, array $payload): ?string {
+    if (!preg_match('/API error \(400\)/', $message)) {
+      return NULL;
+    }
+    $json = strstr($message, '{');
+    $data = $json !== FALSE ? json_decode($json, TRUE) : NULL;
+    $error = is_array($data['error'] ?? NULL) ? $data['error'] : [];
+    $code = (string) ($error['code'] ?? '');
+    $text = (string) ($error['message'] ?? '');
+    if (!in_array($code, ['unsupported_parameter', 'unsupported_value'], TRUE) && !preg_match('/^Unsupported (parameter|value)/i', $text)) {
+      return NULL;
+    }
+    $param = strtok((string) ($error['param'] ?? ''), '.[');
+    if ($param === FALSE || !in_array($param, $this->optionalParams(), TRUE) || !array_key_exists($param, $payload)) {
+      return NULL;
+    }
+    return $param;
+  }
+
+  /**
+   * POST to /responses, dropping optional params the model rejects.
+   */
+  protected function postResponses(string $model, array $payload): array {
+    return $this->sendDroppingRejectedParams($model, $payload, function (array $payload) {
+      return $this->makeRequest($this->baseUrl . '/responses', $payload, [], 'POST', 300);
+    });
   }
 
   /**
@@ -475,33 +418,40 @@ class AIOpenAIAdapter extends AIAdapterBase {
     return NULL;
   }
 
-  protected function chatWithResponsesApi(string $model, array $messages, $temperature, $max_tokens, array $context_extra = []) {
+  protected function chatWithResponsesApi(string $model, array $messages, $temperature, $max_tokens, array $context_extra = [], bool $stream_response = FALSE) {
     [$input_items, $instructions] = $this->toResponsesItemsAndInstructions($messages);
     $effort = $context_extra['reasoning_effort'] ?? 'low';
     $payload = [
       'model' => $model,
       'input' => $input_items,
       'instructions' => $instructions,
+      'temperature' => (float) $temperature,
       'reasoning' => ['effort' => $effort],
       'max_output_tokens' => max((int) $max_tokens, 512),
     ];
-    if (!$this->modelIgnoresTemperature($model)) {
-      $payload['temperature'] = (float) $temperature;
-    }
     if ($format = $this->responsesTextFormat($context_extra)) {
       $payload['text'] = ['format' => $format];
     }
     $payload = $this->sanitizeResponsesPayload($payload);
 
-    $result = $this->makeRequest($this->baseUrl . '/responses', $payload, [], 'POST', 300);
-    if (!empty($result['output_text'])) {
-      return trim($result['output_text']);
+    if ($stream_response) {
+      $payload = $this->withoutRejectedParams($model, $payload);
+      $payload['stream'] = TRUE;
+      return $this->buildStreamingResponse($this->baseUrl . '/responses', [
+        'method' => 'POST',
+        'headers' => array_merge([
+          'Accept' => 'text/event-stream',
+          'Content-Type' => 'application/json',
+        ], $this->getDefaultHeaders()),
+        'data' => json_encode($payload),
+        'timeout' => 300,
+      ], function ($data) {
+        return ($data['type'] ?? '') === 'response.output_text.delta' ? (string) ($data['delta'] ?? '') : '';
+      }, $this->streamRetryDroppingRejectedParams($model, $payload));
     }
-    return $this->collapseOutputParts($result);
-  }
 
-  protected function modelIgnoresTemperature(string $model): bool {
-    return (bool) preg_match('/^(gpt-5|o[0-9])/i', $model);
+    $result = $this->postResponses($model, $payload);
+    return $this->collapseOutputParts($result);
   }
 
   protected function toResponsesItemsAndInstructions(array $messages): array {
@@ -830,28 +780,4 @@ class AIOpenAIAdapter extends AIAdapterBase {
     ];
   }
 
-  protected function normalizeToolResponse(array $result): array {
-    $choice = $result['choices'][0] ?? [];
-    $message = $choice['message'] ?? [];
-    $tool_calls = [];
-
-    foreach ($message['tool_calls'] ?? [] as $tool_call) {
-      $arguments = $tool_call['function']['arguments'] ?? '{}';
-      if (is_string($arguments)) {
-        $arguments = json_decode($arguments, TRUE) ?: [];
-      }
-      $tool_calls[] = [
-        'id' => $tool_call['id'] ?? '',
-        'name' => $tool_call['function']['name'] ?? '',
-        'arguments' => $arguments,
-      ];
-    }
-
-    return [
-      'finish_reason' => $choice['finish_reason'] ?? 'stop',
-      'content' => trim($message['content'] ?? ''),
-      'tool_calls' => $tool_calls,
-      'raw' => $result,
-    ];
-  }
 }
