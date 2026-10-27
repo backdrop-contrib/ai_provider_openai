@@ -8,7 +8,7 @@ OpenAI provider for the Backdrop CMS AI module.
 
 ## Issues
 
-Bugs and feature requests should be reported in the [Issue Queue](https://github.com/backdrop-contrib/openai_openai/issues).
+Bugs and feature requests should be reported in the [Issue Queue](https://github.com/backdrop-contrib/ai_provider_openai/issues).
 
 ## Current Maintainer
 
